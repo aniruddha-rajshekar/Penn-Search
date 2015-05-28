@@ -1,0 +1,153 @@
+/* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
+/*
+ * Copyright (c) 2010 University of Pennsylvania
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation;
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ */
+
+#ifndef PENN_CHORD_H
+#define PENN_CHORD_H
+
+#include "ns3/penn-application.h"
+#include "ns3/penn-chord-message.h"
+#include "ns3/ping-request.h"
+#include <openssl/sha.h>
+#include "ns3/ipv4-address.h"
+#include <map>
+#include <set>
+#include <vector>
+#include <string>
+#include "ns3/socket.h"
+#include "ns3/nstime.h"
+#include "ns3/timer.h"
+#include "ns3/uinteger.h"
+#include "ns3/boolean.h"
+
+using namespace ns3;
+
+
+class PennChord : public PennApplication
+{
+  public:
+    static TypeId GetTypeId (void);
+    PennChord ();
+    virtual ~PennChord ();
+
+    void SendPing (Ipv4Address destAddress, std::string pingMessage);
+    void RecvMessage (Ptr<Socket> socket);
+    void ProcessPingReq (PennChordMessage message, Ipv4Address sourceAddress, uint16_t sourcePort);
+    void ProcessPingRsp (PennChordMessage message, Ipv4Address sourceAddress, uint16_t sourcePort);
+    void AuditPings ();
+    void ProcessJoinChord (PennChordMessage message, Ipv4Address sourceAddress, uint16_t sourcePort);
+    void ProcessFindSuccessor (PennChordMessage message, Ipv4Address sourceAddress, uint16_t sourcePort);
+    void FindSuccessor (PennChordMessage message, Ipv4Address destAddr, uint16_t sourcePort, unsigned char *m_digest);
+    void SendFindSuccessor (PennChordMessage message, Ipv4Address destAddr, uint16_t sourcePort, unsigned char *targetDigest);
+    void ReplyFindSuccessor (PennChordMessage message, Ipv4Address destAddr, uint16_t sourcePort, Ipv4Address successorAddr);
+    void ProcessJoinChordSuccess (PennChordMessage message, Ipv4Address sourceAddress, uint16_t sourcePort);
+    void ProcessJoinChordFail (PennChordMessage message, Ipv4Address sourceAddress, uint16_t sourcePort);
+    void SendNotify(PennChordMessage message, Ipv4Address, int16_t sourcePort);
+    void ProcessNotify(PennChordMessage message, Ipv4Address sourceAddress, uint16_t sourcePort);
+    void Stabilize();
+    void ProcessStabilizeReq (PennChordMessage message, Ipv4Address sourceAddress, int16_t sourcePort);
+    void ProcessStabilizeResp (PennChordMessage message, Ipv4Address sourceAddress, int16_t sourcePort);
+    void ProcessRingstate (PennChordMessage message, Ipv4Address sourceAddress, int16_t sourcePort);
+    void DisplayChordDetails ();
+    void ProcessLeaveSuccessor (PennChordMessage message, Ipv4Address sourceAddress, int16_t sourcePort);
+    void ProcessLeavePredecessor (PennChordMessage message, Ipv4Address sourceAddress, int16_t sourcePort);
+    void SetSuccessorAddress (Ipv4Address ipv4Address);
+    void SetPredecessorAddress (Ipv4Address ipv4Address);
+    void FixFinger (void);
+    void SendFindFinger (uint16_t i);
+    void ProcessFindFinger (PennChordMessage message, Ipv4Address sourceAddress, uint16_t sourcePort);
+    void ReplyFindFinger(PennChordMessage message, Ipv4Address targetAddr, uint16_t sourcePort,uint16_t targetInd);
+    void ProcessFindFingerSuccess (PennChordMessage message, Ipv4Address sourceAddress, uint16_t sourcePort);
+    Ipv4Address FindNextHop (unsigned char *targetDigest);
+    void LookupPublish (std::string key, uint16_t flag, uint32_t transactionId);
+    void ProcessLookupPublish (PennChordMessage message, Ipv4Address sourceAddress, uint16_t sourcePort);
+    void SendLookupPublish (PennChordMessage message, unsigned char* digestkey, uint16_t sourcePort);
+    void ReplyLookupPublishSuccess (PennChordMessage message, unsigned char* targetDigest, uint16_t sourcePort);
+    void ProcessLookupPublishSuccess (PennChordMessage message,Ipv4Address sourceAddress,uint16_t sourcePort);
+    void LookupCallback (uint16_t flag, std::string key, Ipv4Address addressResponsible, uint32_t transactionId);
+
+    uint32_t GetNextTransactionId ();
+    void StopChord ();
+
+    // Callback with Application Layer (add more when required)
+    void SetPingSuccessCallback (Callback <void, Ipv4Address, std::string> pingSuccessFn);
+    void SetPingFailureCallback (Callback <void, Ipv4Address, std::string> pingFailureFn);
+    void SetPingRecvCallback (Callback <void, Ipv4Address, std::string> pingRecvFn);
+    void SetLookupPublishSuccessCallback (Callback <void, std::string, Ipv4Address, uint32_t> lookupPublishSuccessFn);
+    void SetSearchInitialSuccessCallback (Callback <void, std::string, Ipv4Address, uint32_t> searchInitialSuccessFn);
+    void SetSearchBeginSuccessCallback (Callback <void, std::string, Ipv4Address, uint32_t> searchBeginSuccessFn);
+    void SetChordJoinNotifyCallback (Callback <void, Ipv4Address, uint32_t> chordJoinNotifyFn);
+    void SetChordLeaveNotifyCallback (Callback <void, Ipv4Address, uint32_t> chordLeaveNotifyFn);
+    
+    static float globalHopCount;
+    static float globalQueryCount;
+    
+
+    // From PennApplication
+    virtual void ProcessCommand (std::vector<std::string> tokens);
+    
+  protected:
+    virtual void DoDispose ();
+    
+  private:
+    virtual void StartApplication (void);
+    virtual void StopApplication (void);
+    virtual void DoTest(void);
+    
+    bool m_chordStatus;
+    Ipv4Address m_localAddress;
+    Ipv4Address m_successorAddr;
+    Ipv4Address m_predecessorAddr;
+    unsigned char m_localDigest[20];
+    unsigned char m_successorDigest[20];
+    unsigned char m_predecessorDigest[20];
+    std::map<uint16_t, Ipv4Address> m_fingerTable;
+
+    void SHA_1 (Ipv4Address ipv4Addr, unsigned char *digest);
+    void SHA_1 (std::string s, unsigned char *digest);
+    std::string DisplayHEX (unsigned char *digest);
+    uint8_t compareSHA1 (unsigned char *digest1, unsigned char *digest2);
+    void FindIndexHash (uint16_t index, unsigned char *indexHash);
+   
+    uint32_t m_currentTransactionId;
+    Ptr<Socket> m_socket;
+    Time m_pingTimeout;
+    Time m_stabilizeTimeout;
+    Time m_fixFingerTimeout;
+    uint16_t m_appPort;
+    // Timers
+    Timer m_auditPingsTimer;
+    Timer m_stabilizeTimer;
+    Timer m_fixFingerTimer;
+    // Ping tracker
+    std::map<uint32_t, Ptr<PingRequest> > m_pingTracker;
+    // Callbacks
+    Callback <void, Ipv4Address, std::string> m_pingSuccessFn;
+    Callback <void, Ipv4Address, std::string> m_pingFailureFn;
+    Callback <void, Ipv4Address, std::string> m_pingRecvFn;
+    Callback <void, std::string, Ipv4Address, uint32_t > m_lookupPublishSuccessFn;
+    Callback <void, std::string, Ipv4Address, uint32_t > m_searchInitialSuccessFn;
+    Callback <void, std::string, Ipv4Address, uint32_t > m_searchBeginSuccessFn;
+    Callback <void, Ipv4Address, uint32_t > m_chordJoinNotifyFn;
+    Callback <void, Ipv4Address, uint32_t > m_chordLeaveNotifyFn;
+};
+
+
+#endif
+
+
+

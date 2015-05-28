@@ -1,0 +1,895 @@
+/* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
+/*
+ * Copyright (c) 2010 University of Pennsylvania
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation;
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ */
+
+
+#include "penn-search.h"
+
+#include "ns3/random-variable.h"
+#include "ns3/inet-socket-address.h"
+
+using namespace ns3;
+
+TypeId
+PennSearch::GetTypeId ()
+{
+  static TypeId tid = TypeId ("PennSearch")
+    .SetParent<PennApplication> ()
+    .AddConstructor<PennSearch> ()
+    .AddAttribute ("AppPort",
+                   "Listening port for Application",
+                   UintegerValue (10000),
+                   MakeUintegerAccessor (&PennSearch::m_appPort),
+                   MakeUintegerChecker<uint16_t> ())
+    .AddAttribute ("ChordPort",
+                   "Listening port for Application",
+                   UintegerValue (10001),
+                   MakeUintegerAccessor (&PennSearch::m_chordPort),
+                   MakeUintegerChecker<uint16_t> ())
+    .AddAttribute ("PingTimeout",
+                   "Timeout value for PING_REQ in milliseconds",
+                   TimeValue (MilliSeconds (2000)),
+                   MakeTimeAccessor (&PennSearch::m_pingTimeout),
+                   MakeTimeChecker ())
+    ;
+  return tid;
+}
+
+PennSearch::PennSearch ()
+  : m_auditPingsTimer (Timer::CANCEL_ON_DESTROY)
+{
+  m_chord = NULL;
+  RandomVariable random;
+  SeedManager::SetSeed (time (NULL));
+  random = UniformVariable (0x00000000, 0xFFFFFFFF);
+  m_currentTransactionId = random.GetInteger ();
+}
+
+PennSearch::~PennSearch ()
+{
+
+}
+
+void
+PennSearch::DoDispose ()
+{
+  StopApplication ();
+  PennApplication::DoDispose ();
+}
+
+void
+PennSearch::StartApplication (void)
+{
+  // Create and Configure PennChord
+  ObjectFactory factory;
+  factory.SetTypeId (PennChord::GetTypeId ());
+  factory.Set ("AppPort", UintegerValue (m_chordPort));
+  m_chord = factory.Create<PennChord> ();
+  m_chord->SetNode (GetNode ());
+  m_chord->SetNodeAddressMap (m_nodeAddressMap);
+  m_chord->SetAddressNodeMap (m_addressNodeMap);
+  m_chord->SetModuleName ("CHORD");
+  std::string nodeId = GetNodeId ();
+  m_chord->SetNodeId (nodeId);
+  m_chord->SetLocalAddress(m_local);
+
+  if (PennApplication::IsRealStack ())
+  {
+    m_chord->SetRealStack (true);
+  } 
+
+  // Configure Callbacks with Chord
+  m_chord->SetPingSuccessCallback (MakeCallback (&PennSearch::HandleChordPingSuccess, this)); 
+  m_chord->SetPingFailureCallback (MakeCallback (&PennSearch::HandleChordPingFailure, this));
+  m_chord->SetPingRecvCallback (MakeCallback (&PennSearch::HandleChordPingRecv, this)); 
+
+  m_chord->SetLookupPublishSuccessCallback (MakeCallback (&PennSearch::HandleChordLookupPublishSuccess, this));
+  m_chord->SetSearchInitialSuccessCallback (MakeCallback (&PennSearch::HandleChordSearchInitialSuccess, this));
+  m_chord->SetSearchBeginSuccessCallback (MakeCallback (&PennSearch::HandleChordSearchBeginSuccess, this));
+  m_chord->SetChordJoinNotifyCallback (MakeCallback (&PennSearch::HandleChordJoinNotify, this));
+  m_chord->SetChordLeaveNotifyCallback (MakeCallback (&PennSearch::HandleChordLeaveNotify, this));
+
+  // Start Chord
+  m_chord->SetStartTime (Simulator::Now());
+  m_chord->Start ();
+  if (m_socket == 0)
+    { 
+      TypeId tid = TypeId::LookupByName ("ns3::UdpSocketFactory");
+      m_socket = Socket::CreateSocket (GetNode (), tid);
+      InetSocketAddress local = InetSocketAddress (Ipv4Address::GetAny(), m_appPort);
+      m_socket->Bind (local);
+      m_socket->SetRecvCallback (MakeCallback (&PennSearch::RecvMessage, this));
+    }  
+  
+  // Configure timers
+  m_auditPingsTimer.SetFunction (&PennSearch::AuditPings, this);
+  // Start timers
+  m_auditPingsTimer.Schedule (m_pingTimeout);
+}
+
+void
+PennSearch::StopApplication (void)
+{
+    //Stop chord
+  m_chord->StopChord ();
+  // Close socket
+  if (m_socket)
+    {
+      m_socket->Close ();
+      m_socket->SetRecvCallback (MakeNullCallback<void, Ptr<Socket> > ());
+      m_socket = 0;
+    }
+
+  // Cancel timers
+  m_auditPingsTimer.Cancel ();
+  m_pingTracker.clear ();
+  m_searchTracker.clear();
+}
+
+void
+PennSearch::ProcessCommand (std::vector<std::string> tokens)
+{
+  std::vector<std::string>::iterator iterator = tokens.begin();
+  std::string command = *iterator;
+  if (command == "CHORD")
+    { 
+      // Send to Chord Sub-Layer
+      tokens.erase (iterator);
+      m_chord->ProcessCommand (tokens);
+    } 
+
+  if (command == "PUBLISH")
+  {
+      iterator++;
+      std::string filename = *iterator; 
+      std::string line;
+      std::string docx;
+      std::string keyWord;
+      std::vector<std::string> docName;
+      std::vector<std::string> strtoken;
+      std::map<std::string,std::vector<std::string> >::iterator iterInvertList;
+
+      char *fcstr=new char[filename.length() + 1];
+      strcpy(fcstr,filename.c_str());
+      char result[50]={'\0'};
+      const char *cstr="../ns-3/upenn-cis553/keys/";
+      //strcat(result,cstr);
+      strcat(result,fcstr);
+      std::ifstream keyfile(result);
+      m_invertListMap.clear();
+
+      if(keyfile.is_open())
+      {
+          while(getline(keyfile,line))
+          {
+              if (line.empty())
+              {
+                  continue;
+              }
+              strtoken.clear();
+              Tokenizer(line, strtoken," ");
+              std::vector<std::string>::iterator it=strtoken.begin();
+              docx=*it;
+              it++;
+
+              for(;it!=strtoken.end();it++)
+              {
+                 // From each line put the Doc0 value in a string.
+                 // Iterator pointing to the keys, do .find in map. If map.end() insert to the map. Else insert to the vector.
+                  keyWord=*it;
+                  iterInvertList=m_invertListMap.find(keyWord);
+
+                  if(iterInvertList == m_invertListMap.end())
+                  {
+                      docName.clear();
+                      docName.push_back(docx);
+                      m_invertListMap[keyWord] = docName;
+                  }
+                  else
+                  {
+                      iterInvertList->second.push_back(docx);
+                  }
+              }
+          }
+      }
+      else
+      {
+          SEARCH_LOG("File "<<filename <<" Open Unsuccesful");
+          return;
+      }
+      keyfile.close();
+      for(std::map<std::string,std::vector<std::string> >::iterator iter=m_invertListMap.begin(); iter!=m_invertListMap.end();iter++)
+      {
+          for(std::vector<std::string>::iterator iter1=iter->second.begin(); iter1!=iter->second.end();iter1++)
+          {
+              SEARCH_LOG ("Publish <"<< iter->first << ","<< *iter1<<">");
+          }
+      }
+
+      Publish();
+      delete fcstr;
+  }
+  if (command == "SEARCH")
+  {
+      iterator++;
+      std::string nodeId = *iterator;
+      Ipv4Address nodeAddr = ResolveNodeIpAddress(nodeId);
+      if (nodeAddr == Ipv4Address::GetAny())
+      {
+          ERROR_LOG("Wrong parameters");
+          return;
+      }
+      iterator++;
+      std::string commandline;
+
+      std::vector<std::string> keyList;
+      for (;iterator != tokens.end(); iterator++)
+      {
+          keyList.push_back(*iterator);
+          commandline.append(*iterator);
+          commandline.append(" ");
+      }
+      SEARCH_LOG("Search<"<<commandline<<">");
+      uint32_t transactionId = GetNextTransactionId ();
+      Ptr<Packet> packet = Create<Packet> ();
+      PennSearchMessage message = PennSearchMessage (PennSearchMessage::SEARCH_INITIAL, transactionId);
+      message.SetSearchInitial (GetLocalAddress(), keyList);
+      packet->AddHeader (message);
+      m_socket->SendTo (packet, 0 , InetSocketAddress (nodeAddr, m_appPort));
+  }
+
+  if (command == "PING")
+    {
+      if (tokens.size() < 3)
+        {
+          ERROR_LOG ("Insufficient PING params..."); 
+          return;
+        }
+      iterator++;
+      if (*iterator != "*")
+        {
+          std::string nodeId = *iterator;
+          iterator++;
+          std::string pingMessage = *iterator;
+          SendPing (nodeId, pingMessage);
+        }
+      else
+        {
+          iterator++;
+          std::string pingMessage = *iterator;
+          std::map<uint32_t, Ipv4Address>::iterator iter;
+          for (iter = m_nodeAddressMap.begin () ; iter != m_nodeAddressMap.end (); iter++)  
+            {
+              std::ostringstream sin;
+              uint32_t nodeNumber = iter->first;
+              sin << nodeNumber;
+              std::string nodeId = sin.str();    
+              SendPing (nodeId, pingMessage);
+            }
+        }
+    }
+}
+
+void
+PennSearch::SendPing (std::string nodeId, std::string pingMessage)
+{
+  // Send Ping Via-Chord layer 
+  SEARCH_LOG ("Sending Ping via Chord Layer to node: " << nodeId << " Message: " << pingMessage);
+  Ipv4Address destAddress = ResolveNodeIpAddress(nodeId);
+  m_chord->SendPing (destAddress, pingMessage);
+}
+
+void
+PennSearch::SendPennSearchPing (Ipv4Address destAddress, std::string pingMessage)
+{
+  if (destAddress != Ipv4Address::GetAny ())
+    {
+      uint32_t transactionId = GetNextTransactionId ();
+      SEARCH_LOG ("Sending PING_REQ to Node: " << ReverseLookup(destAddress) << " IP: " << destAddress << " Message: " << pingMessage << " transactionId: " << transactionId);
+      Ptr<PingRequest> pingRequest = Create<PingRequest> (transactionId, Simulator::Now(), destAddress, pingMessage);
+      // Add to ping-tracker
+      m_pingTracker.insert (std::make_pair (transactionId, pingRequest));
+      Ptr<Packet> packet = Create<Packet> ();
+      PennSearchMessage message = PennSearchMessage (PennSearchMessage::PING_REQ, transactionId);
+      message.SetPingReq (pingMessage);
+      packet->AddHeader (message);
+      m_socket->SendTo (packet, 0 , InetSocketAddress (destAddress, m_appPort));
+    }
+
+
+}
+
+void
+PennSearch::RecvMessage (Ptr<Socket> socket)
+{
+  Address sourceAddr;
+  Ptr<Packet> packet = socket->RecvFrom (sourceAddr);
+  InetSocketAddress inetSocketAddr = InetSocketAddress::ConvertFrom (sourceAddr);
+  Ipv4Address sourceAddress = inetSocketAddr.GetIpv4 ();
+  uint16_t sourcePort = inetSocketAddr.GetPort ();
+  PennSearchMessage message;
+  packet->RemoveHeader (message);
+
+  switch (message.GetMessageType ())
+    {
+      case PennSearchMessage::PING_REQ:
+        ProcessPingReq (message, sourceAddress, sourcePort);
+        break;
+      case PennSearchMessage::PING_RSP:
+        ProcessPingRsp (message, sourceAddress, sourcePort);
+        break;
+      case PennSearchMessage::STORE_LIST:
+        ProcessStoreList (message, sourceAddress, sourcePort);
+        break;
+      case PennSearchMessage::SEARCH_INITIAL:
+        ProcessSearchInitial (message, sourceAddress, sourcePort);
+        break;
+      case PennSearchMessage::SEARCH_BEGIN:
+        ProcessSearchBegin (message, sourceAddress, sourcePort);
+        break;
+      case PennSearchMessage::SEARCH:
+        ProcessSearch (message, sourceAddress, sourcePort);
+        break;
+      case PennSearchMessage::SEARCH_COMPLETE:
+        ProcessSearchComplete (message, sourceAddress, sourcePort);
+        break;
+      case PennSearchMessage::PASS_KEYS:
+        ProcessPassKeys (message, sourceAddress, sourcePort);
+        break;
+      default:
+        ERROR_LOG ("Unknown Message Type!");
+        break;
+    }
+}
+
+void
+PennSearch::ProcessPingReq (PennSearchMessage message, Ipv4Address sourceAddress, uint16_t sourcePort)
+{
+
+    // Use reverse lookup for ease of debug
+    std::string fromNode = ReverseLookup (sourceAddress);
+    SEARCH_LOG ("Received PING_REQ, From Node: " << fromNode << ", Message: " << message.GetPingReq().pingMessage);
+    // Send Ping Response
+    PennSearchMessage resp = PennSearchMessage (PennSearchMessage::PING_RSP, message.GetTransactionId());
+    resp.SetPingRsp (message.GetPingReq().pingMessage);
+    Ptr<Packet> packet = Create<Packet> ();
+    packet->AddHeader (resp);
+    m_socket->SendTo (packet, 0 , InetSocketAddress (sourceAddress, sourcePort));
+}
+
+void
+PennSearch::ProcessPingRsp (PennSearchMessage message, Ipv4Address sourceAddress, uint16_t sourcePort)
+{
+  // Remove from pingTracker
+  std::map<uint32_t, Ptr<PingRequest> >::iterator iter;
+  iter = m_pingTracker.find (message.GetTransactionId ());
+  if (iter != m_pingTracker.end ())
+    {
+      std::string fromNode = ReverseLookup (sourceAddress);
+      SEARCH_LOG ("Received PING_RSP, From Node: " << fromNode << ", Message: " << message.GetPingRsp().pingMessage);
+      m_pingTracker.erase (iter);
+    }
+  else
+    {
+      DEBUG_LOG ("Received invalid PING_RSP!");
+    }
+}
+
+void
+PennSearch::AuditPings ()
+{
+  std::map<uint32_t, Ptr<PingRequest> >::iterator iter;
+  for (iter = m_pingTracker.begin () ; iter != m_pingTracker.end();)
+    {
+      Ptr<PingRequest> pingRequest = iter->second;
+      if (pingRequest->GetTimestamp().GetMilliSeconds() + m_pingTimeout.GetMilliSeconds() <= Simulator::Now().GetMilliSeconds())
+        {
+          DEBUG_LOG ("Ping expired. Message: " << pingRequest->GetPingMessage () << " Timestamp: " << pingRequest->GetTimestamp().GetMilliSeconds () << " CurrentTime: " << Simulator::Now().GetMilliSeconds ());
+          // Remove stale entries
+          m_pingTracker.erase (iter++);
+        }
+      else
+        {
+          ++iter;
+        }
+    }
+  // Rechedule timer
+  m_auditPingsTimer.Schedule (m_pingTimeout); 
+}
+
+uint32_t
+PennSearch::GetNextTransactionId ()
+{
+  return m_currentTransactionId++;
+}
+
+void
+PennSearch::Publish()
+{
+    for(std::map<std::string,std::vector<std::string> >::iterator iter=m_invertListMap.begin(); iter!=m_invertListMap.end();iter++)
+    {
+        uint32_t transactionId = GetNextTransactionId ();
+        m_chord->LookupPublish (iter->first, (uint16_t)0, transactionId);
+    }
+}
+
+void
+PennSearch::SendInvertList(std::string key, Ipv4Address addressResponsible, uint32_t transactionId)
+{
+    std::map<std::string,std::vector<std::string> >::iterator iter = m_invertListMap.find(key);
+    if(iter== m_invertListMap.end())
+    {
+        ERROR_LOG("Key is not avaliable in the map anymore, may be publish commands are entered without gap");
+        return;
+    }
+    std::vector<std::string> docVector = iter->second;
+    std::string invertedList;
+    for(uint16_t i=0; i<docVector.size(); i++)
+    {
+        invertedList.append(docVector[i]);
+        invertedList.append(" ");
+    }
+    SEARCH_LOG("InvertedListShip<"<<key<<", "<<invertedList<<">");
+    //SEARCH_LOG ("Sending STORE_LIST to Node: " << ReverseLookup(addressResponsible) << " IP: " << addressResponsible <<" transactionId: " << transactionId<<" Key: " << key);
+    Ptr<Packet> packet = Create<Packet> ();
+    PennSearchMessage newMessage = PennSearchMessage (PennSearchMessage::STORE_LIST,transactionId);
+    newMessage.SetStoreList (key, docVector);
+    packet->AddHeader (newMessage);
+    m_socket->SendTo (packet, 0 , InetSocketAddress (addressResponsible,m_appPort));
+}
+
+void
+PennSearch::ProcessStoreList (PennSearchMessage message, Ipv4Address sourceAddress, uint16_t sourcePort)
+{
+    //SEARCH_LOG ("Recieved STORE_LIST from Node: " << ReverseLookup(sourceAddress) << " IP: " << sourceAddress << " transactionId: " << message.GetTransactionId());
+    std::vector<std::string> recVect = message.GetStoreList().docVector;
+    std::map<std::string,std::vector<std::string> >::iterator iter = m_dataMap.find(message.GetStoreList().key);
+
+    //SEARCH_LOG ("m_dataMap modification Key: "<<message.GetStoreList().key);
+    for(uint16_t i=0; i < recVect.size();i++)
+    {
+        SEARCH_LOG("Store<"<< message.GetStoreList().key <<", "<<recVect[i]<<">");
+    }
+
+    if (iter==m_dataMap.end())
+    {
+        m_dataMap[message.GetStoreList().key]= recVect;
+        return;
+    }
+    for (int i=0; i<recVect.size();i++)
+    {
+        iter->second.push_back(recVect[i]);
+    }
+    return;
+}
+
+void
+PennSearch::ProcessSearchInitial (PennSearchMessage message, Ipv4Address sourceAddress, uint16_t sourcePort)
+{
+    std::vector<std::string> docList;
+    std::string key = message.GetSearchInitial().keyList[0];
+    SearchData searchData = {message.GetSearchInitial().initiatorAddress, message.GetSearchInitial().keyList, docList};
+    m_searchTracker.insert (std::make_pair (message.GetTransactionId(), searchData));
+    m_chord->LookupPublish(key, (uint16_t)1, message.GetTransactionId());
+}
+
+void
+PennSearch::SendSearchBegin (std::string key,Ipv4Address addressResponsible, uint32_t transactionId)
+{
+    std::map<uint32_t, SearchData >::iterator iter;
+    iter = m_searchTracker.find(transactionId);
+    if (iter != m_searchTracker.end ())
+      {
+        Ptr<Packet> packet = Create<Packet> ();
+        PennSearchMessage message = PennSearchMessage (PennSearchMessage::SEARCH_BEGIN, transactionId);
+        message.SetSearchBegin (iter->second.initiatorAddress, iter->second.keyList,iter->second.docList);
+        packet->AddHeader (message);
+        m_socket->SendTo (packet, 0 , InetSocketAddress (addressResponsible, m_appPort));
+        m_searchTracker.erase (iter);
+      }
+    else
+      {
+        DEBUG_LOG ("Received invalid LOOKUP!");
+      }
+}
+
+void
+PennSearch::ProcessSearchBegin (PennSearchMessage message, Ipv4Address sourceAddress, uint16_t sourcePort)
+{
+    std::vector<std::string> currentKeyList = message.GetSearchBegin().keyList;
+    std::vector<std::string>::iterator iter = currentKeyList.begin();
+    std::string key = *iter;
+    currentKeyList.erase(iter);
+    std::vector<std::string> currentDocList;
+    std::map<std::string, std::vector<std::string> >::iterator it = m_dataMap.find(key);
+    if (it == m_dataMap.end())
+    {
+        SendSearchComplete (message.GetSearchBegin().initiatorAddress, currentKeyList, currentDocList, message.GetTransactionId());
+        return;
+    }
+    currentDocList = it->second;
+    if(currentKeyList.empty())
+    {
+        SendSearchComplete (message.GetSearchBegin().initiatorAddress, currentKeyList, currentDocList, message.GetTransactionId());
+        //SEARCH_LOG("SearchResults<"<<ReverseLookup(message.GetSearch().initiatorAddress)<<", Empty List>");
+        return;
+    }
+    if(currentDocList.empty())
+    {
+        SendSearchComplete (message.GetSearchBegin().initiatorAddress, currentKeyList, currentDocList, message.GetTransactionId());
+        return;
+    }
+    SearchData searchData = {message.GetSearchBegin().initiatorAddress, currentKeyList, currentDocList};
+    m_searchTracker.insert (std::make_pair (message.GetTransactionId(), searchData));
+    m_chord->LookupPublish(*(currentKeyList.begin()), (uint16_t)2, message.GetTransactionId());
+}
+
+void
+PennSearch::SendSearch (std::string key,Ipv4Address addressResponsible, uint32_t transactionId)
+{
+    std::map<uint32_t, SearchData >::iterator iter;
+    iter = m_searchTracker.find(transactionId);
+    if (iter != m_searchTracker.end ())
+      {
+        Ptr<Packet> packet = Create<Packet> ();
+        PennSearchMessage message = PennSearchMessage (PennSearchMessage::SEARCH, transactionId);
+        message.SetSearch (iter->second.initiatorAddress, iter->second.keyList,iter->second.docList);
+        packet->AddHeader (message);
+        m_socket->SendTo (packet, 0 , InetSocketAddress (addressResponsible, m_appPort));
+        m_searchTracker.erase (iter);
+      }
+    else
+      {
+        DEBUG_LOG ("Received invalid LOOKUP!");
+      }
+}
+
+void
+PennSearch::ProcessSearch (PennSearchMessage message, Ipv4Address sourceAddress, uint16_t sourcePort)
+{
+    std::vector<std::string> currentKeyList = message.GetSearch().keyList;
+    std::vector<std::string>::iterator iter = currentKeyList.begin();
+    std::string key = *iter;
+    currentKeyList.erase(iter);
+    std::vector<std::string> currentDocList = m_dataMap.find(key)->second;
+    std:: vector<std::string> FinalDocList = FindIntersection(currentDocList,message.GetSearch().docList);
+    if(currentKeyList.empty())
+    {
+        SendSearchComplete (message.GetSearch().initiatorAddress, currentKeyList, FinalDocList, message.GetTransactionId());
+        //SEARCH_LOG("SearchResults<"<<ReverseLookup(message.GetSearch().initiatorAddress)<<", Empty List>");
+        return;
+    }
+    if(FinalDocList.empty())
+    {
+        SendSearchComplete (message.GetSearch().initiatorAddress, currentKeyList, FinalDocList, message.GetTransactionId());
+        return;
+    }
+    SearchData searchData = {message.GetSearch().initiatorAddress, currentKeyList, FinalDocList};
+    m_searchTracker.insert (std::make_pair (message.GetTransactionId(), searchData));
+    m_chord->LookupPublish(*(currentKeyList.begin()), (uint16_t)2, message.GetTransactionId());
+}
+
+void
+PennSearch::SendSearchComplete (Ipv4Address initiatorAddress, std::vector<std::string> keyList, std::vector<std::string> docList, uint32_t transactionId)
+{
+    Ptr<Packet> packet = Create<Packet> ();
+    PennSearchMessage message = PennSearchMessage (PennSearchMessage::SEARCH_COMPLETE, transactionId);
+    message.SetSearchComplete (keyList,docList);
+    packet->AddHeader (message);
+    m_socket->SendTo (packet, 0 , InetSocketAddress (initiatorAddress, m_appPort));
+}
+
+void
+PennSearch::ProcessSearchComplete (PennSearchMessage message, Ipv4Address sourceAddress, uint16_t sourcePort)
+{
+    //SEARCH_LOG("Final Doc List Received");
+    std::string final_output;
+    for(uint8_t i=0; i<message.GetSearchComplete().docList.size(); i++)
+    {
+        final_output.append(message.GetSearchComplete().docList[i]);
+        final_output.append(" ");
+        //PRINT_LOG("\t"<< message.GetSearchComplete().docList[i]);
+    }
+
+    SEARCH_LOG("SearchResults<"<<ReverseLookup(GetLocalAddress())<<", "<<final_output<<">");
+    //SEARCH_LOG("Final Key List Received");
+    for(uint8_t i=0; i<message.GetSearchComplete().keyList.size(); i++)
+    {
+        //PRINT_LOG("\t"<< message.GetSearchComplete().keyList[i]);
+    }
+
+}
+
+void
+PennSearch::PassKeysJoin (Ipv4Address predecessorAddress, uint32_t transactionId)
+{
+    std::map<std::string, std::vector<std::string> >::iterator it;
+    std::map<std::string, std::vector<std::string> >::iterator iter;
+    unsigned char predHash[20];
+    unsigned char localHash[20];
+    unsigned char digestHash[20];
+    SHA_1(predecessorAddress, predHash);
+    SHA_1(GetLocalAddress(), localHash);
+
+    for(iter=m_dataMap.begin();iter!=m_dataMap.end();)
+    {
+        memset(digestHash, 0, 20);
+        SHA_1(iter->first,digestHash);
+        if(compareSHA1(predHash, localHash))
+        {
+            if(compareSHA1(digestHash,predHash) || compareSHA1 (localHash, digestHash))
+            {
+                iter++;
+                continue;
+            }
+        }
+        else if (compareSHA1(digestHash,predHash) && compareSHA1 (localHash, digestHash))
+        {
+            iter++;
+            continue;
+        }
+        uint32_t new_transactionId = GetNextTransactionId ();
+        Ptr<Packet> packet = Create<Packet> ();
+        PennSearchMessage message = PennSearchMessage (PennSearchMessage::PASS_KEYS, new_transactionId);
+        message.SetPassKeys (iter->first,iter->second);
+        packet->AddHeader (message);
+        m_socket->SendTo (packet, 0 , InetSocketAddress (predecessorAddress, m_appPort));
+        it=iter;
+        it++;
+        m_dataMap.erase(iter);
+        iter=it;
+    }
+}
+
+void
+PennSearch::PassKeysLeave (Ipv4Address successorAddress, uint32_t transactionId)
+{
+    std::map<std::string, std::vector<std::string> >::iterator iter;
+    if(m_dataMap.empty())
+        return;
+    for(iter=m_dataMap.begin();iter!=m_dataMap.end();iter++)
+    {
+        uint32_t new_transactionId = GetNextTransactionId ();
+        Ptr<Packet> packet = Create<Packet> ();
+        PennSearchMessage message = PennSearchMessage (PennSearchMessage::PASS_KEYS, new_transactionId);
+        message.SetPassKeys (iter->first, iter->second);
+        packet->AddHeader (message);
+        m_socket->SendTo (packet, 0 , InetSocketAddress (successorAddress, m_appPort));
+    }
+    m_dataMap.clear();
+}
+
+void
+PennSearch::ProcessPassKeys (PennSearchMessage message, Ipv4Address sourceAddress, uint16_t sourcePort)
+{
+    std::vector<std::string> recVect = message.GetPassKeys().docVector;
+    std::map<std::string,std::vector<std::string> >::iterator iter = m_dataMap.find(message.GetPassKeys().key);
+/*
+    for(uint16_t i=0; i < recVect.size();i++)
+    {
+        SEARCH_LOG("PassKeys<"<< message.GetPassKeys().key <<": "<<recVect[i]<<">");
+    }
+*/
+    if (iter==m_dataMap.end())
+    {
+        m_dataMap[message.GetPassKeys().key]= recVect;
+        return;
+    }
+    for (int i=0; i<recVect.size();i++)
+    {
+        iter->second.push_back(recVect[i]);
+    }
+    return;
+}
+
+
+//////////////////////////////////////////////////////////////////////////////////////
+// Handle Chord Callbacks
+
+void
+PennSearch::HandleChordPingFailure (Ipv4Address destAddress, std::string message)
+{
+  SEARCH_LOG ("Chord Ping Expired! Destination nodeId: " << ReverseLookup(destAddress) << " IP: " << destAddress << " Message: " << message);
+}
+
+void
+PennSearch::HandleChordPingSuccess (Ipv4Address destAddress, std::string message)
+{
+  SEARCH_LOG ("Chord Ping Success! Destination nodeId: " << ReverseLookup(destAddress) << " IP: " << destAddress << " Message: " << message);
+  // Send ping via search layer 
+  SendPennSearchPing (destAddress, message);
+}
+
+void
+PennSearch::HandleChordPingRecv (Ipv4Address destAddress, std::string message)
+{
+  SEARCH_LOG ("Chord Layer Received Ping! Source nodeId: " << ReverseLookup(destAddress) << " IP: " << destAddress << " Message: " << message);
+  return;
+}
+
+void
+PennSearch::HandleChordLookupPublishSuccess ( std::string key, Ipv4Address AddressResponsible, uint32_t transactionId)
+{
+    //SEARCH_LOG ("Lookup Success for Publish - Key: "<< key<<" Node Responsible: "<<ReverseLookup(AddressResponsible));
+    SendInvertList(key, AddressResponsible, transactionId);
+    return;
+}
+
+void
+PennSearch::HandleChordSearchInitialSuccess ( std::string key, Ipv4Address AddressResponsible, uint32_t transactionId)
+{
+    //SEARCH_LOG ("Lookup Success for Search Initial - Key: "<< key<<" Node Responsible: "<<ReverseLookup(AddressResponsible));
+    SendSearchBegin (key, AddressResponsible, transactionId);
+    return;
+}
+
+void
+PennSearch::HandleChordSearchBeginSuccess ( std::string key, Ipv4Address AddressResponsible, uint32_t transactionId)
+{
+    //SEARCH_LOG ("Lookup Success for Search - Key: "<< key<<" Node Responsible: "<<ReverseLookup(AddressResponsible));
+    SendSearch (key, AddressResponsible, transactionId);
+    return;
+}
+
+void
+PennSearch::HandleChordJoinNotify ( Ipv4Address predecessorAddress, uint32_t transactionId)
+{
+   //SEARCH_LOG("Predecessor Address: "<<predecessorAddress);
+    PassKeysJoin(predecessorAddress, transactionId);
+    return;
+}
+
+void
+PennSearch::HandleChordLeaveNotify ( Ipv4Address successorAddress, uint32_t transactionId)
+{
+    //SEARCH_LOG("lEAVEING - Successor Address :" <<  successorAddress);
+    PassKeysLeave(successorAddress, transactionId);
+    return;
+}
+
+// Override PennLog
+
+void
+PennSearch::SetTrafficVerbose (bool on)
+{
+  m_chord->SetTrafficVerbose (on);
+  g_trafficVerbose = on;
+}
+
+void
+PennSearch::SetErrorVerbose (bool on)
+{ 
+  m_chord->SetErrorVerbose (on);
+  g_errorVerbose = on;
+}
+
+void
+PennSearch::SetDebugVerbose (bool on)
+{
+  m_chord->SetDebugVerbose (on);
+  g_debugVerbose = on;
+}
+
+void
+PennSearch::SetStatusVerbose (bool on)
+{
+  m_chord->SetStatusVerbose (on);
+  g_statusVerbose = on;
+}
+
+void
+PennSearch::SetChordVerbose (bool on)
+{
+  m_chord->SetChordVerbose (on);
+  g_chordVerbose = on;
+}
+
+void
+PennSearch::SetSearchVerbose (bool on)
+{
+  m_chord->SetSearchVerbose (on);
+  g_searchVerbose = on;
+}
+
+void
+PennSearch::Tokenizer(const std::string& str,
+                      std::vector<std::string>& tokens,
+                      const std::string& delimiters)
+{
+    // Skip delimiters at beginning.
+    std::string::size_type lastPos = str.find_first_not_of(delimiters, 0);
+    // Find first "non-delimiter".
+    std::string::size_type pos     = str.find_first_of(delimiters, lastPos);
+
+    while (std::string::npos != pos || std::string::npos != lastPos)
+    {
+        // Found a token, add it to the vector.
+        tokens.push_back(str.substr(lastPos, pos - lastPos));
+        // Skip delimiters.  Note the "not_of"
+        lastPos = str.find_first_not_of(delimiters, pos);
+        // Find next "non-delimiter"
+        pos = str.find_first_of(delimiters, lastPos);
+    }
+}
+
+std::vector<std::string>
+PennSearch::FindIntersection (std::vector<std::string> v1, std::vector<std::string> v2)
+{
+    std::vector<std::string> v3;
+    //std::vector<std::string>::iterator it;
+    std::sort (v1.begin(), v1.end());
+    std::sort (v2.begin(), v2.end());
+    //it = std::set_intersection (v1.begin(), v1.end(), v2.begin(), v2.end(), v3.begin());
+    std::set_intersection (v1.begin(), v1.end(), v2.begin(), v2.end(), back_inserter(v3));
+    //v3.resize(it-v3.begin());
+    return v3;
+}
+
+void
+PennSearch::SHA_1 (Ipv4Address ipv4Addr, unsigned char *digest)
+{
+  std::ostringstream stream;
+  stream<<ipv4Addr;
+  std::string s=stream.str();
+/*
+  unsigned char *ch = new unsigned char [s.size()+1];
+  std::copy(s.begin(), s.end(), ch);
+  ch[s.size()]='\0';
+*/
+  //unsigned char digest[20]={0};
+
+  SHA1((unsigned char*)s.c_str(),s.size(),digest);
+  //SHA1(ch,strlen((const char*)ch),digest);
+  //delete[] ch;
+
+  //return digest;
+}
+
+void
+PennSearch::SHA_1 (std::string s, unsigned char *digest)
+{
+/*
+  std::ostringstream stream;
+  stream<<ipv4Addr;
+  std::string s=stream.str();
+
+  unsigned char *ch = new unsigned char [s.size()+1];
+  std::copy(s.begin(), s.end(), ch);
+  ch[s.size()]='\0';
+*/
+  //unsigned char digest[20]={0};
+
+  SHA1((unsigned char*)s.c_str(),s.size(),digest);
+  //SHA1(ch,strlen((const char*)ch),digest);
+  //delete[] ch;
+  //return digest;
+}
+
+
+uint8_t
+PennSearch::compareSHA1 (unsigned char *digest1, unsigned char *digest2)
+{
+    for (uint8_t i=0; i<20; i++)
+    {
+        if (digest1[i]>digest2[i])
+            return 1;
+        else if (digest1[i]<digest2[i])
+            return 0;
+    }
+    return 2;
+}
+

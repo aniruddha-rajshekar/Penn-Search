@@ -1,0 +1,12 @@
+MILESTONE 1 DESIGN
+
+	The Neighbor Discovery begins with NeighborDiscovery() function being called by an initiator node. This functions initiates the process by broadcasting a packet named 'ND_REQ' with TTL as 1. Since all the neighbors lie within one hop, they receive the initiator packet. The neighbors then reply to the initiator node with a packet named 'ND_RSP'. As the the initiator node receives the 'ND_RSP' packet, it confirms whether the packet is addressed to itself, and if it is, it retrieves the neighbor's address using the GetOriginatorAddress() function. The initiator also makes a note of the socket through which it received the ND_RSP packet and retrieves the Interface Address using 'm_socketAddresses' table. With the required data available, the initiator immadiately updates the 'm_neighborTable' table. To reiterate the process with regular intervals, we use a timer 'm_ndTimer' and a timeout value 'm_ndTimeout' which is set to 2000ms.
+
+Since the neighbor discovery happens every 'm_ndTimeout' time, the changes in the topology might atmost take 'm_ndTimeout' time to be reflected in the 'm_neighborTable' table.
+
+The 'm_neighborTable' is a map which stores the information about neighbors in the form of entries.Each entry has a key value as node number and a structure variable 'NeighborTableEntry' which contains Neighbor's main address and the current node's interface address that is connected to this particular node.
+
+The neighbor discovery functions in both 'LS' and 'DV' routing protocols imitate each other. They follow the same procedure to discover the neighbors.
+ 
+
+
